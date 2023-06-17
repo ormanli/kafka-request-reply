@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"strconv"
 	"sync"
 	"syscall"
 
 	"github.com/Shopify/sarama"
-	"github.com/ormanli/kafka-request-reply"
 )
 
 func main() {
@@ -20,15 +20,22 @@ func main() {
 
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
+	config.Producer.Return.Errors = true
+	config.Producer.Partitioner = sarama.NewManualPartitioner
 
-	producer, err := sarama.NewSyncProducer([]string{"localhost:9092"}, config)
+	kafkaHostPort := os.Getenv("KAFKA_HOST_PORT")
+	if kafkaHostPort == "" {
+		kafkaHostPort = "localhost:9092"
+	}
+
+	producer, err := sarama.NewSyncProducer([]string{kafkaHostPort}, config)
 	if err != nil {
 		log.Fatalln("Failed to start Sarama producer:", err)
 	}
 
 	defer producer.Close()
 
-	consumerGroup, err := sarama.NewConsumerGroup([]string{"localhost:9092"}, "reply-service", config)
+	consumerGroup, err := sarama.NewConsumerGroup([]string{kafkaHostPort}, "reply-service", config)
 	if err != nil {
 		log.Fatalln("Failed to start Sarama consumer:", err)
 	}
@@ -45,7 +52,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for {
-			if err := consumerGroup.Consume(ctx, []string{kafka.TopicHelloRequest}, helloRequestConsumer); err != nil {
+			if err := consumerGroup.Consume(ctx, []string{TopicHelloRequest}, helloRequestConsumer); err != nil {
 				log.Panicf("Error from consumer: %v", err)
 			}
 			if ctx.Err() != nil {
@@ -80,7 +87,7 @@ func (c *helloRequestConsumer) ConsumeClaim(session sarama.ConsumerGroupSession,
 		case message := <-claim.Messages():
 			session.MarkMessage(message, "")
 
-			requestMessage := &kafka.RequestMessage{}
+			requestMessage := &RequestMessage{}
 			err := json.Unmarshal(message.Value, requestMessage)
 			if err != nil {
 				return err
@@ -90,14 +97,14 @@ func (c *helloRequestConsumer) ConsumeClaim(session sarama.ConsumerGroupSession,
 			partition := 0
 
 			for _, header := range message.Headers {
-				if string(header.Key) == kafka.HeaderReplyTopic {
+				if string(header.Key) == HeaderReplyTopic {
 					topic = string(header.Value)
-				} else if string(header.Key) == kafka.HeaderReplyPartition {
+				} else if string(header.Key) == HeaderReplyPartition {
 					partition, _ = strconv.Atoi(string(header.Value))
 				}
 			}
 
-			replyMessage := &kafka.ReplyMessage{Says: fmt.Sprintf("Hello, %s", requestMessage.Name)}
+			replyMessage := &ReplyMessage{Says: fmt.Sprintf("Hello, %s", requestMessage.Name)}
 			b, err := json.Marshal(replyMessage)
 			if err != nil {
 				return err
@@ -107,14 +114,32 @@ func (c *helloRequestConsumer) ConsumeClaim(session sarama.ConsumerGroupSession,
 				Topic: topic,
 				Value: sarama.ByteEncoder(b),
 				Headers: []sarama.RecordHeader{
-					{Key: []byte(kafka.HeaderReplyTo), Value: []byte(requestMessage.Name)},
+					{Key: []byte(HeaderReplyTo), Value: []byte(requestMessage.Name)},
 				},
 				Partition: int32(partition),
 			}
 
-			c.producer.SendMessage(msg)
+			_, _, err = c.producer.SendMessage(msg)
+			if err != nil {
+				log.Printf("error: %s", err)
+			}
+
+			log.Printf("Replied to %q from [%s,%d] to [%s,%d]", requestMessage.Name, claim.Topic(), claim.Partition(), topic, partition)
 		case <-session.Context().Done():
 			return nil
 		}
 	}
+}
+
+const TopicHelloRequest = "hello_request"
+const HeaderReplyTopic = "reply_topic"
+const HeaderReplyPartition = "reply_partition"
+const HeaderReplyTo = "reply_to"
+
+type RequestMessage struct {
+	Name string `json:"name"`
+}
+
+type ReplyMessage struct {
+	Says string `json:"says"`
 }

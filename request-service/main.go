@@ -7,12 +7,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Shopify/sarama"
-	"github.com/ormanli/kafka-request-reply"
 )
 
 func main() {
@@ -22,24 +24,12 @@ func main() {
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
 
-	producer, err := sarama.NewSyncProducer([]string{"localhost:9092"}, config)
-	if err != nil {
-		log.Fatalln("Failed to start Sarama producer:", err)
+	kafkaHostPort := os.Getenv("KAFKA_HOST_PORT")
+	if kafkaHostPort == "" {
+		kafkaHostPort = "localhost:9092"
 	}
 
-	defer producer.Close()
-
-	client, err := sarama.NewClient([]string{"localhost:9092"}, config)
-	if err != nil {
-		log.Fatalln("Failed to start Sarama client:", err)
-	}
-
-	partitions, err := client.Partitions(kafka.TopicHelloReply)
-	if err != nil {
-		log.Fatalln("Failed to get partitions:", err)
-	}
-
-	consumerGroup, err := sarama.NewConsumerGroup([]string{"localhost:9092"}, "request-service", config)
+	consumerGroup, err := sarama.NewConsumerGroup([]string{kafkaHostPort}, "request-service", config)
 	if err != nil {
 		log.Fatalln("Failed to start Sarama consumer:", err)
 	}
@@ -53,7 +43,7 @@ func main() {
 
 	go func() {
 		for {
-			if err := consumerGroup.Consume(ctx, []string{kafka.TopicHelloReply}, helloReplyConsumer); err != nil {
+			if err := consumerGroup.Consume(ctx, []string{TopicHelloReply}, helloReplyConsumer); err != nil {
 				log.Panicf("Error from consumer: %v", err)
 			}
 			if ctx.Err() != nil {
@@ -65,30 +55,45 @@ func main() {
 
 	<-helloReplyConsumer.ready
 
-	http.HandleFunc("/hello", helloHandler(producer, helloReplyConsumer, partitions[0]))
+	producer, err := sarama.NewSyncProducer([]string{kafkaHostPort}, config)
+	if err != nil {
+		log.Fatalln("Failed to start Sarama producer:", err)
+	}
 
-	log.Printf("Request service started")
-	http.ListenAndServe(":8080", nil)
+	defer producer.Close()
+
+	http.HandleFunc("/hello", helloHandler(producer, helloReplyConsumer))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Request service started on %s", port)
+	http.ListenAndServe(fmt.Sprintf(":%s", port), nil)
 }
 
-func helloHandler(producer sarama.SyncProducer, consumer *helloReplyConsumer, partition int32) func(w http.ResponseWriter, req *http.Request) {
+func helloHandler(producer sarama.SyncProducer, consumer *helloReplyConsumer) func(w http.ResponseWriter, req *http.Request) {
 	return func(w http.ResponseWriter, req *http.Request) {
 		defer req.Body.Close()
 		b, _ := io.ReadAll(req.Body)
 
-		m := &kafka.RequestMessage{}
+		m := &RequestMessage{}
 		json.Unmarshal(b, m)
 
+		replyPartition := consumer.randomPartition()
 		msg := &sarama.ProducerMessage{
-			Topic: kafka.TopicHelloRequest,
+			Topic: TopicHelloRequest,
 			Value: sarama.ByteEncoder(b),
 			Headers: []sarama.RecordHeader{
-				{Key: []byte(kafka.HeaderReplyPartition), Value: []byte(fmt.Sprintf("%d", partition))},
-				{Key: []byte(kafka.HeaderReplyTopic), Value: []byte(kafka.TopicHelloReply)},
+				{Key: []byte(HeaderReplyPartition), Value: []byte(fmt.Sprintf("%d", replyPartition))},
+				{Key: []byte(HeaderReplyTopic), Value: []byte(TopicHelloReply)},
 			},
 		}
 
-		returnChannel := consumer.Add(m.Name)
+		returnChannel := consumer.register(m.Name)
+
+		log.Printf("Send request for %q to get reply [%s,%d]", m.Name, TopicHelloReply, replyPartition)
 
 		producer.SendMessage(msg)
 
@@ -102,18 +107,32 @@ func helloHandler(producer sarama.SyncProducer, consumer *helloReplyConsumer, pa
 }
 
 type helloReplyConsumer struct {
-	ready   chan bool
-	returns map[string]chan<- string
+	ready                chan bool
+	returns              map[string]chan<- string
+	mu                   sync.Mutex
+	partitions           atomic.Pointer[[]int32]
+	randomPartitionIndex int64
 }
 
-func (c *helloReplyConsumer) Add(name string) <-chan string {
+func (c *helloReplyConsumer) register(name string) <-chan string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	returnChannel := make(chan string, 1)
 	c.returns[name] = returnChannel
 
 	return returnChannel
 }
 
-func (c *helloReplyConsumer) Setup(sarama.ConsumerGroupSession) error {
+func (c *helloReplyConsumer) randomPartition() int32 {
+	partitions := *c.partitions.Load()
+	defer atomic.AddInt64(&c.randomPartitionIndex, 1)
+
+	return partitions[int(c.randomPartitionIndex)%len(partitions)]
+}
+
+func (c *helloReplyConsumer) Setup(cgs sarama.ConsumerGroupSession) error {
+	partitions := cgs.Claims()[TopicHelloReply]
+	c.partitions.Store(&partitions)
 	close(c.ready)
 	return nil
 }
@@ -128,7 +147,7 @@ func (c *helloReplyConsumer) ConsumeClaim(session sarama.ConsumerGroupSession, c
 		case message := <-claim.Messages():
 			session.MarkMessage(message, "")
 
-			m := &kafka.ReplyMessage{}
+			m := &ReplyMessage{}
 			err := json.Unmarshal(message.Value, m)
 			if err != nil {
 				return err
@@ -136,14 +155,36 @@ func (c *helloReplyConsumer) ConsumeClaim(session sarama.ConsumerGroupSession, c
 
 			name := ""
 			for _, header := range message.Headers {
-				if string(header.Key) == kafka.HeaderReplyTo {
+				if string(header.Key) == HeaderReplyTo {
 					name = string(header.Value)
 				}
 			}
 
-			c.returns[name] <- m.Says
+			c.mu.Lock()
+			replyChannel := c.returns[name]
+			delete(c.returns, name)
+			c.mu.Unlock()
+
+			replyChannel <- m.Says
+			close(replyChannel)
+
+			log.Printf("Received reply for %q from [%s,%d]", name, claim.Topic(), claim.Partition())
 		case <-session.Context().Done():
 			return nil
 		}
 	}
+}
+
+const TopicHelloRequest = "hello_request"
+const TopicHelloReply = "hello_reply"
+const HeaderReplyTopic = "reply_topic"
+const HeaderReplyPartition = "reply_partition"
+const HeaderReplyTo = "reply_to"
+
+type RequestMessage struct {
+	Name string `json:"name"`
+}
+
+type ReplyMessage struct {
+	Says string `json:"says"`
 }
